@@ -41,28 +41,33 @@
 
 //---------------------------------------------------------------------------
 #include "tdLeap.h"
-using namespace Leap;
 //---------------------------------------------------------------------------
 #include "chai3d.h"
 using namespace chai3d;
 //---------------------------------------------------------------------------
+#include <cstring>
+//---------------------------------------------------------------------------
+
+// Constants
+#define DEG_TO_RAD (3.14159265358979323846 / 180.0)
 
 //=============================================================================
 // GLOBAL VARIABLES
 //=============================================================================
 
-// Leap Motion controller
-static Controller* _controller = NULL;
+// LeapC connection handle
+static LEAP_CONNECTION _connection = NULL;
 
-// internal Leap objects
-static Frame*  _lastFrame;
+// internal tracking data
+static LEAP_TRACKING_EVENT _lastTrackingEvent;
 static int64_t _lastFrameID = -1;
-static Hand*   _lastHand[2];
+static bool _isConnected = false;
+static bool _hasTracking = false;
 
 
 //=============================================================================
-// library internal management
-// =============================================================================
+// INTERNAL HELPER FUNCTIONS
+//=============================================================================
 
 void
 _sleepMs(const unsigned int a_interval)
@@ -81,34 +86,50 @@ _sleepMs(const unsigned int a_interval)
 
 
 void
-_allocate()
+_pollConnection()
 {
-    if (!_controller) {
-        _controller  = new Controller;
-        _lastFrame   = new Frame;
-        _lastHand[0] = new Hand;
-        _lastHand[1] = new Hand;
-        _sleepMs(100);
-    }
-}
+    if (!_connection)
+        return;
 
-
-void
-_deallocate()
-{
-    if (_controller) 
+    LEAP_CONNECTION_MESSAGE msg;
+    unsigned int timeout = 0;
+    
+    while (LeapPollConnection(_connection, timeout, &msg) == eLeapRS_Success)
     {
-        delete _controller;
-        delete _lastFrame;
-        delete _lastHand[0];
-        delete _lastHand[1];
-        _controller = NULL;
+        switch (msg.type)
+        {
+            case eLeapEventType_Connection:
+                _isConnected = true;
+                break;
+
+            case eLeapEventType_ConnectionLost:
+                _isConnected = false;
+                _hasTracking = false;
+                break;
+
+            case eLeapEventType_Tracking:
+                _lastTrackingEvent = *msg.tracking_event;
+                _lastFrameID = msg.tracking_event->info.frame_id;
+                _hasTracking = true;
+                break;
+
+            case eLeapEventType_Device:
+                // Device connected
+                break;
+
+            case eLeapEventType_DeviceLost:
+                // Device disconnected
+                break;
+
+            default:
+                break;
+        }
     }
 }
 
 
 //==========================================================================
-// FUNCTIONS ACCESSIBLE FROM OUTSIDE
+// PUBLIC API FUNCTIONS
 //==========================================================================
 
 //==========================================================================
@@ -122,14 +143,17 @@ _deallocate()
 //==========================================================================
 int __FNCALL tdLeapGetNumDevices()
 {
-    if (!_controller || !_controller->isConnected())
+    if (!_connection || !_isConnected)
     {
         return (-1);
     }
-    else
-    {
-        return (int)(_controller->devices().count());
-    }
+
+    // Poll for any new events
+    _pollConnection();
+
+    // In LeapC, device count is obtained differently
+    // Return 1 if connected, 0 otherwise (simplified approach)
+    return _isConnected ? 1 : 0;
 }
 
 
@@ -144,13 +168,41 @@ int __FNCALL tdLeapGetNumDevices()
 //==========================================================================
 int __FNCALL tdLeapOpen()
 {
-    // make sure controller is allocated
-    _allocate();
-
-    // check if device is physically available
-    if (!_controller || !_controller->isConnected())
+    // Create connection if it doesn't exist
+    if (!_connection)
     {
-        return (-1);
+        LEAP_CONNECTION_CONFIG config;
+        config.size = sizeof(config);
+        config.flags = 0;
+        config.server_namespace = NULL;
+
+        if (LeapCreateConnection(&config, &_connection) != eLeapRS_Success)
+        {
+            return (-1);
+        }
+
+        if (LeapOpenConnection(_connection) != eLeapRS_Success)
+        {
+            LeapDestroyConnection(_connection);
+            _connection = NULL;
+            return (-1);
+        }
+
+        // Wait for connection
+        for (int i = 0; i < 100; i++)
+        {
+            _pollConnection();
+            if (_isConnected)
+                break;
+            _sleepMs(10);
+        }
+
+        if (!_isConnected)
+        {
+            LeapDestroyConnection(_connection);
+            _connection = NULL;
+            return (-1);
+        }
     }
 
     // success
@@ -169,9 +221,16 @@ int __FNCALL tdLeapOpen()
 //==========================================================================
 int __FNCALL tdLeapClose()
 {  
-   _deallocate ();
+    if (_connection)
+    {
+        LeapCloseConnection(_connection);
+        LeapDestroyConnection(_connection);
+        _connection = NULL;
+        _isConnected = false;
+        _hasTracking = false;
+    }
   
-    // error
+    // success
     return (0);
 }
 
@@ -188,80 +247,16 @@ int __FNCALL tdLeapClose()
 bool __FNCALL tdLeapUpdate()
 {
     // check if device is physically available
-    if (!_controller || !_controller->isConnected())
+    if (!_connection || !_isConnected)
     {
         return (false);
     }
 
-    // get latest frame
-    Frame frame = _controller->frame(0);
-    int64_t id = frame.id();
+    // Poll for new tracking data
+    _pollConnection();
 
-    // if the frame is valid
-    if (frame.isValid() && id != _lastFrameID)
-    {
-        // store current (valid) frame into global static frame
-       *_lastFrame   = frame;
-        _lastFrameID = id;
-
-        // get list of hands
-        HandList hands = frame.hands();
-
-        // two hands case
-        if (hands.count() > 1)
-        {
-            // preserve previous assignment when possible
-            if (hands[0].id() == _lastHand[0]->id() || hands[1].id() == _lastHand[1]->id())
-            {
-                *_lastHand[0] = hands[0];
-                *_lastHand[1] = hands[1];
-            }
-            else if (hands[1].id() == _lastHand[0]->id() || hands[0].id() == _lastHand[1]->id())
-            {
-                *_lastHand[0] = hands[1];
-                *_lastHand[1] = hands[0];
-            }
-
-            // otherwise, make sure the first hand is right-handed if there's a right-hand
-            else if (hands[0].isLeft() && hands[0].isRight())
-            {
-                *_lastHand[0] = hands[1];
-                *_lastHand[1] = hands[0];
-            }
-            else
-            {
-                *_lastHand[0] = hands[0];
-                *_lastHand[1] = hands[1];
-            }
-        }
-
-        // one hand case
-        else if (hands.count() > 0)
-        {
-            // preserve previous assignment when possible
-            if (hands[0].id() == _lastHand[0]->id())
-            {
-                *_lastHand[0] = hands[0];
-            }
-            else if (hands[0].id() == _lastHand[1]->id())
-            {
-                *_lastHand[1] = hands[0];
-            }
-
-            // otherwise, make sure that left hands are assigned to the second hand
-            else if (hands[0].isLeft())
-            {
-                *_lastHand[1] = hands[0];
-            }
-            else
-            {
-                *_lastHand[0] = hands[0];
-            }
-        }
-    }
-
-    // one way or another, it worked
-    return (true);
+    // Return true if we have tracking data
+    return _hasTracking;
 }
 
 
@@ -280,27 +275,32 @@ bool __FNCALL tdLeapUpdate()
 bool __FNCALL tdLeapGetPosition(cVector3d a_position[2])
 {
     // check if device is physically available
-    if (!_controller || !_controller->isConnected())
+    if (!_connection || !_isConnected || !_hasTracking)
     {
         return (false);
     }
 
-    // copy hand data
-    for (int i=0; i<2; i++)
+    // Initialize positions to zero
+    a_position[0].set(0.0, 0.0, 0.0);
+    a_position[1].set(0.0, 0.0, 0.0);
+
+    // Process hands (index 0 = right hand, index 1 = left hand)
+    for (uint32_t h = 0; h < _lastTrackingEvent.nHands && h < 2; h++)
     {
-        if (_lastHand[i]->isValid())
-        {
-            Vector center, pos;
-            center = _lastHand[i]->frame().interactionBox().center();
-            pos    = _lastHand[i]->palmPosition();
-            a_position[i].set((pos.z-center.z)*1e-3,
-                              (pos.x-center.x)*1e-3,
-                              (pos.y-center.y)*1e-3);
-        }
-        else
-        {
-            a_position[i].set (0.0, 0.0, 0.0);
-        }
+        LEAP_HAND* hand = &_lastTrackingEvent.pHands[h];
+        
+        // Determine hand index (0 for right, 1 for left)
+        int handIndex = (hand->type == eLeapHandType_Right) ? 0 : 1;
+        
+        // Get palm position in millimeters and convert to meters
+        // Leap coordinate system: x=right, y=up, z=towards user
+        // CHAI3D coordinate system: x=forward, y=right, z=up
+        // Transform: CHAI3D.x = Leap.z, CHAI3D.y = Leap.x, CHAI3D.z = Leap.y
+        a_position[handIndex].set(
+            hand->palm.position.z * 1e-3,  // forward (from Leap z)
+            hand->palm.position.x * 1e-3,  // right (from Leap x)
+            hand->palm.position.y * 1e-3   // up (from Leap y)
+        );
     }
 
     return (true);
@@ -321,44 +321,68 @@ bool __FNCALL tdLeapGetPosition(cVector3d a_position[2])
 //==========================================================================
 bool __FNCALL tdLeapGetRotation(cMatrix3d a_rotation[2])
 {
-    // check if device is physically available and we have a valid hand
-    if (!_controller || !_controller->isConnected())
+    // check if device is physically available
+    if (!_connection || !_isConnected || !_hasTracking)
     {
         return (false);
     }
 
-    // copy hand data
-    for (int i=0; i<2; i++)
+    // Initialize rotations to identity
+    a_rotation[0].identity();
+    a_rotation[1].identity();
+
+    // Process hands
+    for (uint32_t h = 0; h < _lastTrackingEvent.nHands && h < 2; h++)
     {
-        if (_lastHand[i]->isValid())
+        LEAP_HAND* hand = &_lastTrackingEvent.pHands[h];
+        
+        // Determine hand index (0 for right, 1 for left)
+        int handIndex = (hand->type == eLeapHandType_Right) ? 0 : 1;
+        
+        // Get palm orientation quaternion
+        LEAP_QUATERNION q = hand->palm.orientation;
+        
+        // Convert quaternion to rotation matrix
+        float xx = q.x * q.x;
+        float xy = q.x * q.y;
+        float xz = q.x * q.z;
+        float xw = q.x * q.w;
+        float yy = q.y * q.y;
+        float yz = q.y * q.z;
+        float yw = q.y * q.w;
+        float zz = q.z * q.z;
+        float zw = q.z * q.w;
+        
+        // Leap rotation matrix
+        cMatrix3d leapRot;
+        leapRot.set(
+            1 - 2*(yy + zz),     2*(xy - zw),     2*(xz + yw),
+                2*(xy + zw), 1 - 2*(xx + zz),     2*(yz - xw),
+                2*(xz - yw),     2*(yz + xw), 1 - 2*(xx + yy)
+        );
+        
+        // Transform from Leap coordinate system to CHAI3D
+        // Leap: x=right, y=up, z=towards user
+        // CHAI3D: x=forward, y=right, z=up
+        cMatrix3d transform;
+        transform.set(
+            0, 0, 1,
+            1, 0, 0,
+            0, 1, 0
+        );
+        
+        a_rotation[handIndex] = transform * leapRot;
+        
+        // Apply hand-specific adjustments
+        if (hand->type == eLeapHandType_Right)
         {
-            cMatrix3d frame;
-            frame.identity();
-
-            // populate data
-            Matrix rot = _lastHand[i]->basis();
-
-            // return result
-            if (_lastHand[i]->isRight())
-            {
-                a_rotation[i].set(rot.zBasis.z, rot.xBasis.z, rot.yBasis.z,
-                                  rot.zBasis.x, rot.xBasis.x, rot.yBasis.x,
-                                  rot.zBasis.y, rot.xBasis.y, rot.yBasis.y);
-                a_rotation[i].rotateAboutLocalAxisDeg(cVector3d(1,0,0),  90.0);
-                a_rotation[i].rotateAboutLocalAxisDeg(cVector3d(0,0,1),  45.0);
-            }
-            else
-            {
-                a_rotation[i].set( rot.zBasis.z, -rot.xBasis.z,  rot.yBasis.z,
-                                   rot.zBasis.x, -rot.xBasis.x,  rot.yBasis.x,
-                                   rot.zBasis.y, -rot.xBasis.y,  rot.yBasis.y);
-                a_rotation[i].rotateAboutLocalAxisDeg(cVector3d(1,0,0), -90.0);
-                a_rotation[i].rotateAboutLocalAxisDeg(cVector3d(0,0,1), -45.0);
-            }
+            a_rotation[handIndex].rotateAboutLocalAxisDeg(cVector3d(1,0,0),  90.0);
+            a_rotation[handIndex].rotateAboutLocalAxisDeg(cVector3d(0,0,1),  45.0);
         }
         else
         {
-            a_rotation[i].identity();
+            a_rotation[handIndex].rotateAboutLocalAxisDeg(cVector3d(1,0,0), -90.0);
+            a_rotation[handIndex].rotateAboutLocalAxisDeg(cVector3d(0,0,1), -45.0);
         }
     }
 
@@ -371,7 +395,7 @@ bool __FNCALL tdLeapGetRotation(cMatrix3d a_rotation[2])
     Return the hand pinching motion angle from the tracking data retrieved by the last
     \ref tdLeapUpdate() call.
 
-    \fn       bool __FNCALL tdLeapGetGripperAngleRad(double &a_angle[2])
+    \fn       bool __FNCALL tdLeapGetGripperAngleRad(double a_angle[2])
 
     \param a_angle   Returned hand pinching angle.
 
@@ -383,24 +407,26 @@ bool __FNCALL tdLeapGetGripperAngleRad(double a_angle[2])
     // gripper maximum opening angle (in deg)
     const double OPEN_ANGLE = 30.0;
 
-    // check if device is physically available and we have a valid hand
-    if (!_controller || !_controller->isConnected())
+    // check if device is physically available
+    if (!_connection || !_isConnected || !_hasTracking)
     {
         return (false);
     }
 
-    // copy hand data
-    for (int i=0; i<2; i++)
+    // Initialize angles to fully open
+    a_angle[0] = OPEN_ANGLE * DEG_TO_RAD;
+    a_angle[1] = OPEN_ANGLE * DEG_TO_RAD;
+
+    // Process hands
+    for (uint32_t h = 0; h < _lastTrackingEvent.nHands && h < 2; h++)
     {
-        if (_lastHand[i]->isValid())
-        {
-            // read gripper angle
-            a_angle[i] = (1.0-_lastHand[i]->pinchStrength()) * OPEN_ANGLE * DEG_TO_RAD;
-        }
-        else
-        {
-            a_angle[i] = OPEN_ANGLE * DEG_TO_RAD;
-        }
+        LEAP_HAND* hand = &_lastTrackingEvent.pHands[h];
+        
+        // Determine hand index (0 for right, 1 for left)
+        int handIndex = (hand->type == eLeapHandType_Right) ? 0 : 1;
+        
+        // Get pinch strength (0.0 = not pinching, 1.0 = full pinch)
+        a_angle[handIndex] = (1.0 - hand->pinch_strength) * OPEN_ANGLE * DEG_TO_RAD;
     }
 
     return (true);
@@ -412,7 +438,7 @@ bool __FNCALL tdLeapGetGripperAngleRad(double a_angle[2])
     Return the hand open/close status from the tracking data retrieved by the last
     \ref tdLeapUpdate() call.
 
-    \fn       bool __FNCALL tdLeapGetUserSwitches(unsigned int &a_userSwitches[2])
+    \fn       bool __FNCALL tdLeapGetUserSwitches(unsigned int a_userSwitches[2])
 
     \param a_userSwitches   Returned hand open/close status.
 
@@ -421,24 +447,28 @@ bool __FNCALL tdLeapGetGripperAngleRad(double a_angle[2])
 //==========================================================================
 bool __FNCALL tdLeapGetUserSwitches(unsigned int a_userSwitches[2])
 {
-    // check if device is physically available and we have a valid hand
-    if (!_controller || !_controller->isConnected())
+    // check if device is physically available
+    if (!_connection || !_isConnected || !_hasTracking)
     {
         return (false);
     }
 
-    // copy hand data
-    for (int i=0; i<2; i++)
+    // Initialize switches to off
+    a_userSwitches[0] = 0x00;
+    a_userSwitches[1] = 0x00;
+
+    // Process hands
+    for (uint32_t h = 0; h < _lastTrackingEvent.nHands && h < 2; h++)
     {
-        if (_lastHand[i]->isValid())
+        LEAP_HAND* hand = &_lastTrackingEvent.pHands[h];
+        
+        // Determine hand index (0 for right, 1 for left)
+        int handIndex = (hand->type == eLeapHandType_Right) ? 0 : 1;
+        
+        // Get grab strength (0.0 = open hand, 1.0 = fist)
+        if (hand->grab_strength > 0.75)
         {
-            // return result
-            if (_lastHand[i]->grabStrength() > 0.75) a_userSwitches[i] = 0x01;
-            else                                    a_userSwitches[i] = 0x00;
-        }
-        else
-        {
-            a_userSwitches[i] = 0x00;
+            a_userSwitches[handIndex] = 0x01;
         }
     }
 
@@ -448,38 +478,33 @@ bool __FNCALL tdLeapGetUserSwitches(unsigned int a_userSwitches[2])
 
 //==========================================================================
 /*!
-    Returns the latest frame from a given Leap Motion device.
+    Returns the latest tracking event from a given Leap Motion device.
 
     \fn       bool __FNCALL tdLeapGetFrame(void* &a_frame)
 
-    \param a_frame  An (unallocated) pointer that will point to a new frame on the heap.
-                    Cast to Leap::Frame to access all the LeapSDK functionality.
+    \param a_frame  An (unallocated) pointer that will point to a new LEAP_TRACKING_EVENT on the heap.
+                    Cast to LEAP_TRACKING_EVENT* to access all the LeapC functionality.
 
     \return Return __true__ on success, __false__ otherwise.
 
     \note
     It is the responsibility of the caller to deallocate (delete)
-    the frame pointer afterwards.
+    the tracking event pointer afterwards.
 */
 //==========================================================================
 bool __FNCALL tdLeapGetFrame(void* &a_frame)
 {
     // check if device is physically available
-    if (!_controller || !_controller->isConnected())
+    if (!_connection || !_isConnected || !_hasTracking)
     {
-        return (false);
-    }
-
-    // return appropriate value
-    if (_lastFrame->isValid())
-    {
-        a_frame = (void*)(new Frame(*_lastFrame));
-        return (true);
-    }
-    else
-    {
-        // error
         a_frame = NULL;
         return (false);
     }
+
+    // Allocate and copy the tracking event
+    LEAP_TRACKING_EVENT* event = new LEAP_TRACKING_EVENT;
+    memcpy(event, &_lastTrackingEvent, sizeof(LEAP_TRACKING_EVENT));
+    
+    a_frame = (void*)event;
+    return (true);
 }
