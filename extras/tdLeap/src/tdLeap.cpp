@@ -294,10 +294,10 @@ bool __FNCALL tdLeapGetPosition(cVector3d a_position[2])
         
         // Get palm position in millimeters and convert to meters
         // Leap coordinate system: x=right, y=up, z=towards user
-        // CHAI3D coordinate system: x=forward, y=right, z=up
+        // CHAI3D coordinate system: x=towards user, y=right, z=up
         // Transform: CHAI3D.x = Leap.z, CHAI3D.y = Leap.x, CHAI3D.z = Leap.y
         a_position[handIndex].set(
-            hand->palm.position.z * 1e-3,  // forward (from Leap z)
+            hand->palm.position.z * 1e-3,  // towards user (from Leap z)
             hand->palm.position.x * 1e-3,  // right (from Leap x)
             hand->palm.position.y * 1e-3   // up (from Leap y)
         );
@@ -321,72 +321,53 @@ bool __FNCALL tdLeapGetPosition(cVector3d a_position[2])
 //==========================================================================
 bool __FNCALL tdLeapGetRotation(cMatrix3d a_rotation[2])
 {
-    // check if device is physically available
     if (!_connection || !_isConnected || !_hasTracking)
     {
-        return (false);
+        return false;
     }
 
-    // Initialize rotations to identity
     a_rotation[0].identity();
     a_rotation[1].identity();
 
-    // Process hands
+    cMatrix3d T;
+    T.set(
+        0, 0, 1,
+        1, 0, 0,
+        0, 1, 0
+    );
+
+    cMatrix3d Tinv = cTranspose(T); // 直交行列なら inverse = transpose
+
     for (uint32_t h = 0; h < _lastTrackingEvent.nHands && h < 2; h++)
     {
         LEAP_HAND* hand = &_lastTrackingEvent.pHands[h];
-        
-        // Determine hand index (0 for right, 1 for left)
         int handIndex = (hand->type == eLeapHandType_Right) ? 0 : 1;
-        
-        // Get palm orientation quaternion
+
         LEAP_QUATERNION q = hand->palm.orientation;
-        
-        // Convert quaternion to rotation matrix
-        float xx = q.x * q.x;
-        float xy = q.x * q.y;
-        float xz = q.x * q.z;
-        float xw = q.x * q.w;
-        float yy = q.y * q.y;
-        float yz = q.y * q.z;
-        float yw = q.y * q.w;
-        float zz = q.z * q.z;
-        float zw = q.z * q.w;
-        
-        // Leap rotation matrix
-        cMatrix3d leapRot;
-        leapRot.set(
-            1 - 2*(yy + zz),     2*(xy - zw),     2*(xz + yw),
-                2*(xy + zw), 1 - 2*(xx + zz),     2*(yz - xw),
-                2*(xz - yw),     2*(yz + xw), 1 - 2*(xx + yy)
-        );
-        
-        // Transform from Leap coordinate system to CHAI3D
-        // Leap: x=right, y=up, z=towards user
-        // CHAI3D: x=forward, y=right, z=up
-        cMatrix3d transform;
-        transform.set(
-            0, 0, 1,
-            1, 0, 0,
-            0, 1, 0
-        );
-        
-        a_rotation[handIndex] = transform * leapRot;
-        
-        // Apply hand-specific adjustments
-        if (hand->type == eLeapHandType_Right)
+
+        double n = sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+        if (n < 1e-8)
         {
-            a_rotation[handIndex].rotateAboutLocalAxisDeg(cVector3d(1,0,0),  90.0);
-            a_rotation[handIndex].rotateAboutLocalAxisDeg(cVector3d(0,0,1),  45.0);
+            a_rotation[handIndex].identity();
+            continue;
         }
-        else
-        {
-            a_rotation[handIndex].rotateAboutLocalAxisDeg(cVector3d(1,0,0), -90.0);
-            a_rotation[handIndex].rotateAboutLocalAxisDeg(cVector3d(0,0,1), -45.0);
-        }
+
+        double x = q.x / n;
+        double y = q.y / n;
+        double z = q.z / n;
+        double w = q.w / n;
+
+        cMatrix3d Rl;
+        Rl.set(
+            1 - 2*(y*y + z*z),   2*(x*y - z*w),       2*(x*z + y*w),
+            2*(x*y + z*w),       1 - 2*(x*x + z*z),   2*(y*z - x*w),
+            2*(x*z - y*w),       2*(y*z + x*w),       1 - 2*(x*x + y*y)
+        );
+
+        a_rotation[handIndex] = T * Rl * Tinv;
     }
 
-    return (true);
+    return true;
 }
 
 
